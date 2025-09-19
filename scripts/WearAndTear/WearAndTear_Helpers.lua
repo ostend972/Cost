@@ -189,6 +189,8 @@ function Menu_CheckItem(menu_id,index,state)
 end
 --[[ Menu cleanup upon script reload or session exit ]]
 function Menu_CleanUp(menu_id,menu_index)
+   if ToLiss_Airline_Menu_ID ~= nil then ToLiss_XPLM.XPLMDestroyMenu(ToLiss_Airline_Menu_ID) end
+   if ToLiss_CI_Menu_ID ~= nil then ToLiss_XPLM.XPLMDestroyMenu(ToLiss_CI_Menu_ID) end
    if menu_id ~= nil then ToLiss_XPLM.XPLMClearAllMenuItems(menu_id) ToLiss_XPLM.XPLMDestroyMenu(menu_id) end
    if menu_index ~= nil then ToLiss_XPLM.XPLMRemoveMenuItem(ToLiss_XPLM.XPLMFindAircraftMenu(),menu_index) end
 end
