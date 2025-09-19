@@ -30,8 +30,10 @@ local ToLiss_Persistence_Data_Init = {  -- Container table for parameters
 {"Debug",0},                            -- 1 = Enable debug output as default
 {"GradualAging",1},                     -- 1 = Near real-time aging (see UpdateInterval below); 2 = Only update age at aircraft change or X-Plane exit
 {"Persistence",1},                      -- 0 = Disables persistence for aircraft and engine age (will only apply random start values); WILL STILL READ EXISTING PERSISTENCE FILES (WHEN PRESENT)!
-{"RevenuePerKgPerHr",0.85},             -- The revenue per kg of payload per flight hour (adjusted for A321neo - higher capacity)
+-- {"RevenuePerKgPerHr",0.85},             -- The revenue per kg of payload per flight hour (adjusted for A321neo - higher capacity) -- This is now obsolete
 {"Strict",1},                           -- 1 = Less cheating possible by checking cash before overhauls and requiring having been airborne to cash in a flight's revenue
+{"AirlineProfile","AIR_FRANCE"},        -- The currently selected airline profile
+{"CostIndex", 20},                      -- The current Cost Index (0-99)
 }
 -- General
 local Persistence_File = "WearAndTear.txt"  -- Name of the persistence file (stored in the livery's folder)
@@ -61,7 +63,7 @@ VARIABLES, DO NOT CHANGE!
 local ToLiss_Persistence_Data = { }     -- Actual table for the persistence data
 local Persistence_FilePath = nil        -- Will contain the complete path to the persistence file
 local ToLiss_AgeLimit = {Min=-1,Max=2}  -- Container table for the low and high limits for aircraft and engine age, see ToLiss manual
-local ToLiss_Flight = {Airborne=0,EngineRunCounter=0,LockET=0,Payload=0,Phase="[None]",Refuel=0,RefuelCost=0,Revenue=0,Time=0,TimeAircraft=0,TimeEngine=0,OperatingCost=0,FuelConsumed=0,MaintenanceCost=0,CrewCost=0,AirportFees=0}   -- Table for various flight state things
+local ToLiss_Flight = {Airborne=0,EngineRunCounter=0,LockET=0,Payload=0,Phase="[None]",Refuel=0,RefuelCost=0,Revenue=0,Time=0,TimeAircraft=0,TimeEngine=0,OperatingCost=0,FuelConsumed=0,MaintenanceCost=0,CrewCost=0,AirportFees=0,Origin="----",Destination="----"}   -- Table for various flight state things
 local ToLiss_Max_TAS = 470              -- Maximum true air speed (A321neo can reach higher speeds)
 
 -- Airline profiles based on real operational data 2024
@@ -162,29 +164,33 @@ local COMPONENT_WEAR = {
 }
 local ToLiss_MCDU_Perf = nil            -- The value of the performance parameter for the MCDU
 local ToLiss_Menu_ID = nil              -- ID of the wear & tear menu within the aircraft menu
+local ToLiss_Airline_Menu_ID = nil      -- ID of the airline profile submenu
+local ToLiss_CI_Menu_ID = nil           -- ID of the Cost Index submenu
 local ToLiss_Menu_Index = nil           -- Index of the main menu within the aircraft menu
-local ToLiss_Menu_Items = { --Table for main menu items
+local ToLiss_Menu_Items = { --Table for main menu items, DO NOT CHANGE ORDER WITHOUT UPDATING CALLBACKS
 "ToLiss Wear & Tear", -- Index 1
 "Aircraft:",          -- Index 2
 "Engines:",           -- Index 3
 "[Separator]",        -- Index 4
-"Flight Revenue:",    -- Index 5
-"Refuel Cost:",       -- Index 6
-"Cash:",              -- Index 7
-"Operating Cost:",    -- Index 8
-"Economic Dashboard", -- Index 9
-"[Separator]",        -- Index 10
-"MCDU PERF:",         -- Index 11
-"[Separator]",        -- Index 12
-"Debug",              -- Index 13
-"Gradual Aging",      -- Index 14
-"Persistence",        -- Index 15
-"Autosave",           -- Index 16
-"Strict Mode",        -- Index 17
-"[Separator]",        -- Index 18
-"Save Wear And Tear", -- Index 19
-"Load Wear And Tear", -- Index 20
-"Reset Wear And Tear", -- Index 21
+"Airline Profile:",   -- Index 5
+"Cost Index:",        -- Index 6
+"[Separator]",        -- Index 7
+"Import SimBrief Plan",-- Index 8
+"Refuel Cost:",       -- Index 9
+"Cash:",              -- Index 10
+"Operating Cost:",    -- Index 11
+"Economic Dashboard", -- Index 12
+"[Separator]",        -- Index 13
+-- "MCDU PERF:",         -- Index 14 - Obsolete, now automated
+"Debug",              -- Index 14
+"Gradual Aging",      -- Index 15
+"Persistence",        -- Index 16
+"Autosave",           -- Index 17
+"Strict Mode",        -- Index 18
+"[Separator]",        -- Index 19
+"Save Wear And Tear", -- Index 20
+"Load Wear And Tear", -- Index 21
+"Reset Wear And Tear",-- Index 22
 }
 local ToLiss_Menu_Pointer = ffi.new("const char") -- C pointer for the menu, used by the XPLM API
 local ToLiss_OldVals = {Age={0,0},Cash=0,Fuel=0}      -- Stores old values for detemrining changes
@@ -210,11 +216,36 @@ simDR_TrueAirspeed = find_dataref("sim/flightmodel/position/true_airspeed")
 simDR_ToLiss_N1 = find_dataref("AirbusFBW/anim/ENGN1Speed")
 simDR_XPVersion = find_dataref("sim/version/xplane_internal_version")
 if simDR_XPVersion >= 120000 then simDR_RelativePath = find_dataref("sim/aircraft/view/acf_relative_path") end -- Safeguard for XP11
+
+-- MCDU Automation DataRefs (based on user prompt)
+simDR_MCDU_PerfFactor = find_dataref("sim/cockpit2/engine/EGT_correction") -- For PERF factor
+simDR_MCDU_IdleFactor = find_dataref("sim/cockpit2/fmc/idle_factor")      -- For IDLE factor
 --[[
 
 FUNCTIONS
 
 ]]
+--[[ Automatically calculates and sets MCDU PERF and IDLE factors ]]
+function ToLiss_Automate_MCDU_Config()
+    -- Calculate PERF factor based on total wear, clamped to a realistic range (-2 to +3)
+    local perf_factor = Clamp(simDR_AircraftAge + simDR_EngineAge, -2.0, 3.0)
+
+    -- Calculate IDLE factor, scaled proportionally to PERF, clamped to a realistic range (-1 to +1)
+    local idle_factor = Clamp(perf_factor / 3.0, -1.0, 1.0)
+
+    -- Write to datarefs
+    if simDR_MCDU_PerfFactor and simDR_MCDU_IdleFactor then
+        simDR_MCDU_PerfFactor = perf_factor
+        simDR_MCDU_IdleFactor = idle_factor
+        if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then
+            print(string.format("ToLiss Wear and Tear: MCDU Auto-Config - PERF Factor set to %.2f, IDLE Factor set to %.2f", perf_factor, idle_factor))
+        end
+    else
+        if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then
+            print("ToLiss Wear and Tear: MCDU Auto-Config - Could not find PERF/IDLE datarefs.")
+        end
+    end
+end
 --[[ Wrapper for the persistence file to handle empty livery paths ]]
 function Check_LiveryPath()
     if simDR_XPVersion >= 120000 then
@@ -261,11 +292,6 @@ function ToLiss_Calc_AgeFromTime()
     ToLiss_Conv_TimeToAge("Age_Engines",ToLiss_Flight.TimeEngine,Engine_Wear_Time)
     ToLiss_Apply_Age()
 end
---[[ Calculates the PERF parameter for the MCDU ]]
-function ToLiss_Calc_PERF()
-    ToLiss_MCDU_Perf = Clamp(simDR_AircraftAge + simDR_EngineAge,(ToLiss_AgeLimit.Min * 2),(ToLiss_AgeLimit.Max * 2)) -- Clamping limits doubled from age limit because two parameters are taken into account
-    if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then print("ToLiss Wear and Tear: ToLiss MCDU data entry: DATA --> A/C STATUS --> CHG CODE: ARM --> PERF: /"..string.format("%.1f",ToLiss_MCDU_Perf)) end
-end
 --[[ Writes the aircraft and engine age to their datarefs ]]
 function ToLiss_Apply_Age()
     simDR_AircraftAge = Table_GetVal(ToLiss_Persistence_Data,"Age_Aircraft")
@@ -301,11 +327,16 @@ end
 --[[ Pays out a flight ]]
 function ToLiss_Finish_Flight()
     ToLiss_Flight.Time = 0
-    ToLiss_Flight.Revenue = 0
+    ToLiss_Flight.Revenue = 0 -- Obsolete, but reset for cleanliness
     ToLiss_Flight.Refuel = 0
     ToLiss_Flight.RefuelCost = 0
     ToLiss_Flight.Airborne = 0
-    if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then print("ToLiss Wear and Tear: Flight reset.") end
+    ToLiss_Flight.OperatingCost=0
+    ToLiss_Flight.FuelConsumed=0
+    ToLiss_Flight.MaintenanceCost=0
+    ToLiss_Flight.CrewCost=0
+    ToLiss_Flight.AirportFees=0
+    if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then print("ToLiss Wear and Tear: Flight data reset for next leg.") end
     ToLiss_CheckAndSavePersistence()
 end
 --[[ Prints the current flight phase to the dev console ]]
@@ -345,30 +376,59 @@ function ToLiss_Check_FlightState()
     end
 end
 --[[ Calculates payload revenue ]]
-function ToLiss_Calc_Revenue()
-    -- Calculate payload mass from payload stations 1 to 8 (0 is used for Neo engine weight compensation by ToLiss) when all engines are off
-    if ToLiss_Flight.EngineRunCounter == 0 then
-        ToLiss_Calc_Payload()
-        -- Arrival items
-        if ToLiss_Flight.Time > 0 and simDR_ET_Switch ~= 0 and ToLiss_OldVals.Cash ~= (Table_GetVal(ToLiss_Persistence_Data,"Cash") + ToLiss_Flight.Revenue) then
-            if Table_GetVal(ToLiss_Persistence_Data,"Strict") == 0 or (Table_GetVal(ToLiss_Persistence_Data,"Strict") == 1 and ToLiss_Flight.Airborne ~= 0 and ToLiss_Flight.LockET == 0) then
-                Table_SetVal(ToLiss_Persistence_Data,"Cash",(Table_GetVal(ToLiss_Persistence_Data,"Cash") + ToLiss_Flight.Revenue - ToLiss_Flight.RefuelCost))
-                --Table_SetVal(ToLiss_Persistence_Data,"Cash",(Table_GetVal(ToLiss_Persistence_Data,"Cash") + ToLiss_Flight.Revenue))
-                ToLiss_Flight.LockET = 1
-                print("ToLiss Wear and Tear: Flight finished. Flight Revenue: "..ToLiss_Flight.Revenue.." "..Table_GetVal(ToLiss_Persistence_Data,"Currency")..", Fuel Cost: "..ToLiss_Flight.RefuelCost.." "..Table_GetVal(ToLiss_Persistence_Data,"Currency").." --> Net Result: "..(ToLiss_Flight.Revenue - ToLiss_Flight.RefuelCost).." "..Table_GetVal(ToLiss_Persistence_Data,"Currency").." --> New Cash Balance: "..Table_GetVal(ToLiss_Persistence_Data,"Cash").." "..Table_GetVal(ToLiss_Persistence_Data,"Currency"))
-            end
-            ToLiss_Finish_Flight()
-            ToLiss_OldVals.Cash = Table_GetVal(ToLiss_Persistence_Data,"Cash")
+--[[ Handles end-of-flight economic calculations ]]
+function ToLiss_Handle_EndOfFlight_Economics()
+    -- This function should only run once at the end of a flight.
+    -- Condition: Flight has happened (airborne), now on ground, engines off.
+    if ToLiss_Flight.Phase == "Parked After Flight" and ToLiss_Flight.LockET == 0 then
+        if Table_GetVal(ToLiss_Persistence_Data,"Strict") == 1 and ToLiss_Flight.Airborne == 0 then
+            print("ToLiss Wear and Tear: Flight finished without being airborne. No costs processed.")
+            ToLiss_Finish_Flight() -- Reset for next flight
+            return
         end
-    elseif ToLiss_Flight.LockET == 0 then
+
+        -- 1. Calculate Airport Fees for origin and destination
+        local origin_fee = ToLiss_Calc_Airport_Fees(ToLiss_Flight.Origin)
+        local destination_fee = ToLiss_Calc_Airport_Fees(ToLiss_Flight.Destination)
+        ToLiss_Flight.AirportFees = origin_fee + destination_fee
+
+        -- 2. Calculate Total Flight Cost
+        -- OperatingCost has been accumulated during the flight.
+        -- RefuelCost has been accumulated during ground operations.
+        -- AirportFees has just been calculated.
+        local total_cost = ToLiss_Flight.OperatingCost + ToLiss_Flight.RefuelCost + ToLiss_Flight.AirportFees
+
+        -- 3. Deduct costs from cash
+        local initial_cash = Table_GetVal(ToLiss_Persistence_Data,"Cash")
+        Table_SetVal(ToLiss_Persistence_Data,"Cash", initial_cash - total_cost)
+
+        -- 4. Print detailed summary
+        print("==================== FLIGHT COST SUMMARY ====================")
+        print(string.format("ToLiss Wear and Tear: Flight Finished."))
+        print(string.format("  - Accumulated Operating Costs: %.2f %s", ToLiss_Flight.OperatingCost, Table_GetVal(ToLiss_Persistence_Data,"Currency")))
+        print(string.format("  - Fueling Costs: %.2f %s", ToLiss_Flight.RefuelCost, Table_GetVal(ToLiss_Persistence_Data,"Currency")))
+        print(string.format("  - Airport Fees: %.2f %s", ToLiss_Flight.AirportFees, Table_GetVal(ToLiss_Persistence_Data,"Currency")))
+        print(string.format("  --------------------------------------------------"))
+        print(string.format("  - TOTAL FLIGHT COST: %.2f %s", total_cost, Table_GetVal(ToLiss_Persistence_Data,"Currency")))
+        print(string.format("  - Initial Cash: %.2f %s", initial_cash, Table_GetVal(ToLiss_Persistence_Data,"Currency")))
+        print(string.format("  - New Cash Balance: %.2f %s", Table_GetVal(ToLiss_Persistence_Data,"Cash"), Table_GetVal(ToLiss_Persistence_Data,"Currency")))
+        print("=============================================================")
+
+        -- 5. Lock and reset for next flight
+        ToLiss_Flight.LockET = 1 -- Lock to prevent this block from running again
+        ToLiss_Finish_Flight()
+        ToLiss_OldVals.Cash = Table_GetVal(ToLiss_Persistence_Data,"Cash")
+    end
+
+    -- This part tracks the flight time, which is still useful for the dashboard
+    if ToLiss_Flight.EngineRunCounter > 0 and ToLiss_Flight.LockET == 0 then
         ToLiss_Flight.Time = simDR_ET_Hours + (simDR_ET_Minutes / 60)
-        ToLiss_Flight.Revenue = math.ceil(Table_GetVal(ToLiss_Persistence_Data,"RevenuePerKgPerHr") * ToLiss_Flight.Payload * ToLiss_Flight.Time)
     end
 end
 
 --[[ Calculate operating costs based on flight phase and airline profile ]]
 function ToLiss_Calc_Operating_Costs()
-    local airline = "AIR_FRANCE" -- Default airline, can be changed based on livery or user selection
+    local airline = Table_GetVal(ToLiss_Persistence_Data,"AirlineProfile") -- Get currently selected airline
     local profile = AIRLINE_PROFILES[airline]
     
     -- Determine flight phase for fuel consumption
@@ -383,8 +443,10 @@ function ToLiss_Calc_Operating_Costs()
         end
     end
     
-    -- Calculate fuel cost based on phase and efficiency
-    local fuel_consumption = FUEL_CONSUMPTION[phase] * (1 / profile.fuel_efficiency)
+    -- Calculate fuel cost based on phase, efficiency, and Cost Index
+    local ci = Table_GetVal(ToLiss_Persistence_Data, "CostIndex")
+    local ci_fuel_factor = 1 + (ci - 20) * 0.003 -- +/- 3% consumption per 10 points away from CI 20.
+    local fuel_consumption = (FUEL_CONSUMPTION[phase] * ci_fuel_factor) * (1 / profile.fuel_efficiency)
     ToLiss_Flight.FuelConsumed = ToLiss_Flight.FuelConsumed + (fuel_consumption / 3600) -- Convert kg/h to kg/s for per-second update
     
     -- Calculate maintenance cost based on wear
@@ -449,20 +511,6 @@ function ToLiss_Calc_Airport_Fees(destination)
 end
 
 --[[ Update economic dashboard with performance indicators ]]
-function ToLiss_Update_Economic_Dashboard()
-    local total_hours = ToLiss_Flight.Time
-    if total_hours > 0 then
-        local cost_per_hour = ToLiss_Flight.OperatingCost / total_hours
-        local revenue_per_hour = ToLiss_Flight.Revenue / total_hours
-        local profit_per_hour = revenue_per_hour - cost_per_hour
-        
-        if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then
-            print(string.format("ToLiss Wear and Tear: Economic metrics - Cost/hr: %.2f, Revenue/hr: %.2f, Profit/hr: %.2f",
-                cost_per_hour, revenue_per_hour, profit_per_hour))
-        end
-    end
-end
-
 --[[ Autosaving function ]]
 function ToLiss_SavePersistence()
     if Persistence_FilePath ~= nil then Persistence_Write(ToLiss_Persistence_Data,Persistence_FilePath) end
@@ -473,9 +521,139 @@ function ToLiss_CheckAndSavePersistence()
 end
 --[[
 
+SIMBRIEF INTEGRATION
+
+]]
+-- Load required libraries in protected mode
+local socket_ok, socket = pcall(require, "socket.http")
+local xml2lua_ok, xml2lua = pcall(require, "xml2lua")
+local handler_ok, handler = pcall(require, "xmlhandler.tree")
+local ltn12_ok, ltn12 = pcall(require, "ltn12")
+
+--[[ Function to fetch XML from SimBrief URL ]]
+function fetchSimBriefXML(url)
+    if not socket_ok or not ltn12_ok then
+        print("ToLiss Wear and Tear: ERROR - socket.http or ltn12 library not found. SimBrief integration disabled.")
+        return nil
+    end
+
+    local response_body = {}
+    local res, code = socket.request{
+        url = url,
+        sink = ltn12.sink.table(response_body)
+    }
+
+    if code == 200 then
+        print("ToLiss Wear and Tear: SimBrief XML downloaded successfully.")
+        return table.concat(response_body)
+    else
+        print("ToLiss Wear and Tear: ERROR - Failed to download SimBrief XML. HTTP Code: "..tostring(code))
+        return nil
+    end
+end
+
+--[[ Function to parse SimBrief XML data ]]
+function parseSimBriefXML(xml_data)
+    if not xml2lua_ok or not handler_ok then
+        print("ToLiss Wear and Tear: ERROR - xml2lua or xmlhandler.tree not found. SimBrief integration disabled.")
+        return nil
+    end
+
+    local parser = xml2lua.parser(handler)
+    local ok, result = pcall(parser.parse, parser, xml_data)
+
+    if ok and handler.root and handler.root.OFP and handler.root.OFP[1] then
+        print("ToLiss Wear and Tear: SimBrief XML parsed successfully.")
+        return handler.root.OFP[1]
+    else
+        print("ToLiss Wear and Tear: ERROR - Failed to parse SimBrief XML.")
+        print(tostring(result)) -- Print error for debugging
+        return nil
+    end
+end
+
+--[[ Main function to read URL from file and integrate SimBrief data ]]
+function ToLiss_Integrate_SimBrief_From_File()
+    local url_file_path = "scripts/WearAndTear/simbrief_url.txt"
+    local file = io.open(url_file_path, "r")
+
+    if not file then
+        print("ToLiss Wear and Tear: ERROR - Could not find simbrief_url.txt in "..url_file_path)
+        return
+    end
+
+    local url = file:read("*a")
+    file:close()
+    url = string.gsub(url, "%s+", "") -- Trim whitespace
+
+    if url == "" then
+        print("ToLiss Wear and Tear: ERROR - simbrief_url.txt is empty.")
+        return
+    end
+
+    print("ToLiss Wear and Tear: Starting SimBrief import from URL: " .. url)
+    local xml_data = fetchSimBriefXML(url)
+    if not xml_data then return end
+
+    local ofp = parseSimBriefXML(xml_data)
+    if not ofp then return end
+
+    -- Extract and apply data
+    if ofp.general and ofp.general.costindex then
+        local ci = tonumber(ofp.general.costindex)
+        if ci then
+            Table_SetVal(ToLiss_Persistence_Data, "CostIndex", Clamp(ci, 0, 99))
+            print("ToLiss Wear and Tear: SimBrief -> Cost Index set to " .. ci)
+        end
+    end
+
+    if ofp.departure and ofp.departure.icao_code then
+        ToLiss_Flight.Origin = ofp.departure.icao_code
+        print("ToLiss Wear and Tear: SimBrief -> Origin set to " .. ToLiss_Flight.Origin)
+    end
+
+    if ofp.arrival and ofp.arrival.icao_code then
+        ToLiss_Flight.Destination = ofp.arrival.icao_code
+        print("ToLiss Wear and Tear: SimBrief -> Destination set to " .. ToLiss_Flight.Destination)
+    end
+
+    print("ToLiss Wear and Tear: SimBrief data integration complete.")
+    ToLiss_CheckAndSavePersistence()
+end
+
+
+--[[
+
 MENU
 
 ]]
+--[[ Callback for the airline selection submenu ]]
+function ToLiss_Airline_Menu_Callbacks(itemref)
+    local airline_name_clicked = ffi.string(itemref)
+    for profile_key, profile_data in pairs(AIRLINE_PROFILES) do
+        if profile_data.name == airline_name_clicked then
+            Table_SetVal(ToLiss_Persistence_Data, "AirlineProfile", profile_key)
+            print("ToLiss Wear and Tear: Airline Profile changed to " .. profile_data.name)
+            ToLiss_CheckAndSavePersistence() -- Save the change immediately
+            break
+        end
+    end
+end
+
+--[[ Callback for the Cost Index submenu ]]
+function ToLiss_CI_Menu_Callbacks(itemref)
+    local action = ffi.string(itemref)
+    local current_ci = Table_GetVal(ToLiss_Persistence_Data, "CostIndex")
+    local change = tonumber(string.match(action, "[%+%-%d]+"))
+
+    if change then
+        local new_ci = Clamp(current_ci + change, 0, 99)
+        Table_SetVal(ToLiss_Persistence_Data, "CostIndex", new_ci)
+        print("ToLiss Wear and Tear: Cost Index set to " .. new_ci)
+        ToLiss_CheckAndSavePersistence()
+    end
+end
+
 --[[ Menu callbacks. The functions to run or actions to do when picking any non-title and nonseparator item from the table above ]]
 function ToLiss_Menu_Callbacks(itemref)
     for i=2,#ToLiss_Menu_Items do
@@ -489,7 +667,7 @@ function ToLiss_Menu_Callbacks(itemref)
                         print("ToLiss Wear and Tear: Overhauled Aircraft for "..Table_GetVal(ToLiss_Persistence_Data,"Cost_Aircraft").." "..Table_GetVal(ToLiss_Persistence_Data,"Currency")..".")
                         ToLiss_CheckAndSavePersistence()
                         ToLiss_Apply_Age()
-                        ToLiss_Calc_PERF()
+                        ToLiss_Automate_MCDU_Config()
                     end
                 end
             end
@@ -502,48 +680,59 @@ function ToLiss_Menu_Callbacks(itemref)
                         print("ToLiss Wear and Tear: Overhauled Engines for "..Table_GetVal(ToLiss_Persistence_Data,"Cost_Engines").." "..Table_GetVal(ToLiss_Persistence_Data,"Currency")..".")
                         ToLiss_CheckAndSavePersistence()
                         ToLiss_Apply_Age()
-                        ToLiss_Calc_PERF()
+                        ToLiss_Automate_MCDU_Config()
                     end
                 end
             end
-            if i == 5 then -- Flight Revenue
-                if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then ToLiss_Calc_Payload() end
+            -- Index 5, 6 are submenus
+            if i == 8 then -- Import SimBrief Plan
+                ToLiss_Integrate_SimBrief_From_File()
             end
-            if i == 6 then -- Refuel Cost
+            if i == 9 then -- Refuel Cost
                 if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then ToLiss_Flight.RefuelCost = 0 ToLiss_Flight.Refuel = 0 end
             end
-            if i == 9 then -- MCDU PERF
-                ToLiss_Calc_PERF()
+            if i == 12 then -- Economic Dashboard
+                print("================== LIVE ECONOMIC DASHBOARD ==================")
+                print(string.format(" Flight: %s -> %s", ToLiss_Flight.Origin, ToLiss_Flight.Destination))
+                print(string.format(" Flight Time (so far): %.2f hours", ToLiss_Flight.Time))
+                print(string.format(" --- Accumulated Costs ---"))
+                print(string.format("   - Fuel: %.2f %s (%.2f kg)", (ToLiss_Flight.FuelConsumed * Table_GetVal(ToLiss_Persistence_Data,"Cost_FuelPerKg")), Table_GetVal(ToLiss_Persistence_Data,"Currency"), ToLiss_Flight.FuelConsumed))
+                print(string.format("   - Maintenance: %.2f %s", ToLiss_Flight.MaintenanceCost, Table_GetVal(ToLiss_Persistence_Data,"Currency")))
+                print(string.format("   - Crew: %.2f %s", ToLiss_Flight.CrewCost, Table_GetVal(ToLiss_Persistence_Data,"Currency")))
+                print(string.format(" ----------------------------------------------------"))
+                print(string.format(" TOTAL OPERATING COST (so far): %.2f %s", ToLiss_Flight.OperatingCost, Table_GetVal(ToLiss_Persistence_Data,"Currency")))
+                print("==========================================================")
             end
-            if i == 11 then -- Debug
+            -- Index 14 (MCDU PERF) is removed
+            if i == 14 then -- Debug
                 if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 0 then Table_SetVal(ToLiss_Persistence_Data,"Debug",1) else Table_SetVal(ToLiss_Persistence_Data,"Debug",0) ToLiss_CheckAndSavePersistence() end
             end
-            if i == 12 then -- Gradual Aging
+            if i == 15 then -- Gradual Aging
                 if Table_GetVal(ToLiss_Persistence_Data,"GradualAging") == 0 then Table_SetVal(ToLiss_Persistence_Data,"GradualAging",1) else Table_SetVal(ToLiss_Persistence_Data,"GradualAging",0) ToLiss_CheckAndSavePersistence() end
             end
-            if i == 13 then -- Persistence
+            if i == 16 then -- Persistence
                 if Table_GetVal(ToLiss_Persistence_Data,"Persistence") == 0 then Table_SetVal(ToLiss_Persistence_Data,"Persistence",1) else Table_SetVal(ToLiss_Persistence_Data,"Persistence",0) ToLiss_CheckAndSavePersistence() end
             end
-            if i == 14 then -- Autosave
+            if i == 17 then -- Autosave
                 if Table_GetVal(ToLiss_Persistence_Data,"Autosave") == 0 then Table_SetVal(ToLiss_Persistence_Data,"Autosave",1) else Table_SetVal(ToLiss_Persistence_Data,"Autosave",0) ToLiss_CheckAndSavePersistence() end
             end
-            if i == 15 then -- Strict mode
+            if i == 18 then -- Strict mode
                 if Table_GetVal(ToLiss_Persistence_Data,"Strict") == 0 then Table_SetVal(ToLiss_Persistence_Data,"Strict",1) else Table_SetVal(ToLiss_Persistence_Data,"Strict",0) ToLiss_CheckAndSavePersistence() end
             end
-            if i == 17 then -- Save
+            if i == 20 then -- Save
                 ToLiss_SavePersistence()
             end
-            if i == 18 then -- Load
+            if i == 21 then -- Load
                 Persistence_Read(Persistence_FilePath,ToLiss_Persistence_Data)
                 ToLiss_Apply_Age()
-                ToLiss_Calc_PERF()
+                ToLiss_Automate_MCDU_Config()
                 if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then print("ToLiss Wear and Tear: Persistence data applied.") end
             end
-            if i == 19 then -- Reset
+            if i == 22 then -- Reset
                 Table_Copy(ToLiss_Persistence_Data_Init,ToLiss_Persistence_Data)
                 if Random_Start_Vals == true then Randomize_Age() end
                 ToLiss_Apply_Age()
-                ToLiss_Calc_PERF()
+                ToLiss_Automate_MCDU_Config()
                 if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then print("ToLiss Wear and Tear: Persistence data reset.") end
             end
             ToLiss_Menu_Watchdog(ToLiss_Menu_Items,i)
@@ -580,81 +769,62 @@ function ToLiss_Menu_Watchdog(intable,index)
         end
         if ToLiss_Flight.EngineRunCounter > 0 then Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"Operating (Wear: "..Verbalize_Wear(Table_GetVal(ToLiss_Persistence_Data,"Age_Engines"),ToLiss_AgeLimit.Min,ToLiss_AgeLimit.Max)..")",intable) end
     end
-    if index == 5 then -- Flight revenue
-        if ToLiss_Flight.Revenue == 0 then
-            if ToLiss_Flight.Payload > 0 then
-                if ToLiss_Flight.LockET == 0 then
-                    if simDR_ET_Switch ~= 0 and ToLiss_Flight.EngineRunCounter == 0 then Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"[Start Engines and Elapsed Time]",intable) end
-                    if simDR_ET_Switch == 0 and ToLiss_Flight.EngineRunCounter == 0 then Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"[Start Engines]",intable) end
-                    if simDR_ET_Switch ~= 0 and ToLiss_Flight.EngineRunCounter > 0 then Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"[Start Elapsed Time]",intable) end
-                else Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"[Reset Elapsed Time!]",intable) end
-            else
-                Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"[No Payload]",intable)
-            end
-        else
-            if simDR_ET_Switch == 0 and ToLiss_Flight.EngineRunCounter > 0 then
-                if Table_GetVal(ToLiss_Persistence_Data,"Strict") == 1 and ToLiss_Flight.Airborne == 0 then
-                    Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,ToLiss_Flight.Revenue.." "..Table_GetVal(ToLiss_Persistence_Data,"Currency").." (In Progress; Get Airborne!)",intable)
+    if index == 5 then -- Airline Profile
+        local current_profile_key = Table_GetVal(ToLiss_Persistence_Data,"AirlineProfile")
+        local current_profile_name = AIRLINE_PROFILES[current_profile_key].name
+        Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"["..current_profile_name.."]",intable)
+
+        if ToLiss_Airline_Menu_ID ~= nil then
+            local airline_index = 0
+            -- This relies on pairs iterating in a consistent order.
+            for key, profile in pairs(AIRLINE_PROFILES) do
+                if key == current_profile_key then
+                    ToLiss_XPLM.XPLMCheckMenuItem(ToLiss_Airline_Menu_ID, airline_index, 2) -- xplm_Menu_Checked
                 else
-                    Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,ToLiss_Flight.Revenue.." "..Table_GetVal(ToLiss_Persistence_Data,"Currency").." (In Progress)",intable)
+                    ToLiss_XPLM.XPLMCheckMenuItem(ToLiss_Airline_Menu_ID, airline_index, 1) -- xplm_Menu_Unchecked
                 end
-            end
-            if simDR_ET_Switch == 0 and ToLiss_Flight.EngineRunCounter == 0 then
-                Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"[Stop Elapsed Time]",intable)
-            end
-            if simDR_ET_Switch ~= 0 and ToLiss_Flight.EngineRunCounter > 0 then
-                if Table_GetVal(ToLiss_Persistence_Data,"Strict") == 1 and ToLiss_Flight.Airborne == 0 then
-                    Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,ToLiss_Flight.Revenue.." "..Table_GetVal(ToLiss_Persistence_Data,"Currency").." (ET Stopped; Get Airborne!)",intable)
-                else
-                    Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,ToLiss_Flight.Revenue.." "..Table_GetVal(ToLiss_Persistence_Data,"Currency").." (ET Stopped)",intable)
-                end
-            end
-            if simDR_ET_Switch ~= 0 and ToLiss_Flight.EngineRunCounter == 0 then
-                if Table_GetVal(ToLiss_Persistence_Data,"Strict") == 1 and ToLiss_Flight.Airborne == 0 then
-                    Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,ToLiss_Flight.Revenue.." "..Table_GetVal(ToLiss_Persistence_Data,"Currency").." (Arrived; No Payout!)",intable)
-                else
-                    Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,ToLiss_Flight.Revenue.." "..Table_GetVal(ToLiss_Persistence_Data,"Currency").." (Arrived)",intable)
-                end
+                airline_index = airline_index + 1
             end
         end
     end
-    if index == 6 then -- Refuel cost
+    if index == 6 then -- Cost Index
+        local current_ci = Table_GetVal(ToLiss_Persistence_Data, "CostIndex")
+        Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"["..current_ci.."]",intable)
+    end
+    -- index 8 is the import button, no watchdog needed.
+    if index == 9 then -- Refuel cost
         Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,ToLiss_Flight.RefuelCost.." "..Table_GetVal(ToLiss_Persistence_Data,"Currency"),intable)
     end
-    if index == 7 then -- Cash
+    if index == 10 then -- Cash
         Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,Table_GetVal(ToLiss_Persistence_Data,"Cash").." "..Table_GetVal(ToLiss_Persistence_Data,"Currency"),intable)
     end
-    if index == 9 then -- MCDU PERF
-        if ToLiss_MCDU_Perf ~= nil then Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,string.format("%.1f",ToLiss_MCDU_Perf),intable) else Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"-.-",intable) end
-    end
-    if index == 11 then -- Debug
-        if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then Menu_CheckItem(ToLiss_Menu_ID,index,"Activate") else Menu_CheckItem(ToLiss_Menu_ID,index,"Deactivate") end
-    end
-    if index == 12 then -- Gradual Aging
-        if Table_GetVal(ToLiss_Persistence_Data,"GradualAging") == 1 then Menu_CheckItem(ToLiss_Menu_ID,index,"Activate") else Menu_CheckItem(ToLiss_Menu_ID,index,"Deactivate") end
-    end
-    if index == 13 then -- Persistence
-        if Table_GetVal(ToLiss_Persistence_Data,"Persistence") == 1 then Menu_CheckItem(ToLiss_Menu_ID,index,"Activate") else Menu_CheckItem(ToLiss_Menu_ID,index,"Deactivate") end
-    end
-    if index == 14 then -- Autosave
-        if Table_GetVal(ToLiss_Persistence_Data,"Autosave") == 1 then Menu_CheckItem(ToLiss_Menu_ID,index,"Activate") else Menu_CheckItem(ToLiss_Menu_ID,index,"Deactivate") end
-        Menu_ChangeItemSuffix(ToLiss_Menu_ID,index," (Interval: "..Table_GetVal(ToLiss_Persistence_Data,"AutosaveInterval").." s)",intable)
-    end
-    if index == 8 then -- Operating Cost
+    if index == 11 then -- Operating Cost
         Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,string.format("%.2f",ToLiss_Flight.OperatingCost).." "..Table_GetVal(ToLiss_Persistence_Data,"Currency"),intable)
     end
-    if index == 9 then -- Economic Dashboard
+    if index == 12 then -- Economic Dashboard
         local total_hours = ToLiss_Flight.Time
         if total_hours > 0 then
             local cost_per_hour = ToLiss_Flight.OperatingCost / total_hours
-            local revenue_per_hour = ToLiss_Flight.Revenue / total_hours
-            local profit_per_hour = revenue_per_hour - cost_per_hour
-            Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,string.format("Cost/hr: %.2f, Profit/hr: %.2f", cost_per_hour, profit_per_hour),intable)
+            Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,string.format("Cost/hr: %.2f", cost_per_hour),intable)
         else
             Menu_ChangeItemSuffix(ToLiss_Menu_ID,index,"No flight data",intable)
         end
     end
-    if index == 17 then -- Strict Mode
+    -- index 14 (MCDU PERF) is removed
+    if index == 14 then -- Debug
+        if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then Menu_CheckItem(ToLiss_Menu_ID,index,"Activate") else Menu_CheckItem(ToLiss_Menu_ID,index,"Deactivate") end
+    end
+    if index == 15 then -- Gradual Aging
+        if Table_GetVal(ToLiss_Persistence_Data,"GradualAging") == 1 then Menu_CheckItem(ToLiss_Menu_ID,index,"Activate") else Menu_CheckItem(ToLiss_Menu_ID,index,"Deactivate") end
+    end
+    if index == 16 then -- Persistence
+        if Table_GetVal(ToLiss_Persistence_Data,"Persistence") == 1 then Menu_CheckItem(ToLiss_Menu_ID,index,"Activate") else Menu_CheckItem(ToLiss_Menu_ID,index,"Deactivate") end
+    end
+    if index == 17 then -- Autosave
+        if Table_GetVal(ToLiss_Persistence_Data,"Autosave") == 1 then Menu_CheckItem(ToLiss_Menu_ID,index,"Activate") else Menu_CheckItem(ToLiss_Menu_ID,index,"Deactivate") end
+        Menu_ChangeItemSuffix(ToLiss_Menu_ID,index," (Interval: "..Table_GetVal(ToLiss_Persistence_Data,"AutosaveInterval").." s)",intable)
+    end
+    if index == 18 then -- Strict Mode
         if Table_GetVal(ToLiss_Persistence_Data,"Strict") == 1 then Menu_CheckItem(ToLiss_Menu_ID,index,"Activate") else Menu_CheckItem(ToLiss_Menu_ID,index,"Deactivate") end
     end
 end
@@ -669,6 +839,21 @@ function ToLiss_Menu_Build()
             if ToLiss_Menu_Items[i] ~= "[Separator]" then
                 ToLiss_Menu_Pointer = ToLiss_Menu_Items[i]
                 Menu_Indices[i] = ToLiss_XPLM.XPLMAppendMenuItem(ToLiss_Menu_ID,ToLiss_Menu_Items[i],ffi.cast("void *",ToLiss_Menu_Pointer),1)
+
+                if ToLiss_Menu_Items[i] == "Airline Profile:" then
+                    ToLiss_Airline_Menu_ID = ToLiss_XPLM.XPLMCreateMenu("Airline Profile:", ToLiss_Menu_ID, Menu_Indices[i]-2, function(inMenuRef,inItemRef) ToLiss_Airline_Menu_Callbacks(inItemRef) end, ffi.cast("void *", "airline_submenu"))
+                    for _, profile_data in pairs(AIRLINE_PROFILES) do
+                        ToLiss_XPLM.XPLMAppendMenuItem(ToLiss_Airline_Menu_ID, profile_data.name, ffi.cast("void *", profile_data.name), 1)
+                    end
+                end
+
+                if ToLiss_Menu_Items[i] == "Cost Index:" then
+                    ToLiss_CI_Menu_ID = ToLiss_XPLM.XPLMCreateMenu("Cost Index:", ToLiss_Menu_ID, Menu_Indices[i]-2, function(inMenuRef,inItemRef) ToLiss_CI_Menu_Callbacks(inItemRef) end, ffi.cast("void *", "ci_submenu"))
+                    local ci_actions = {"CI +10", "CI -10", "CI +1", "CI -1"}
+                    for _, action in ipairs(ci_actions) do
+                        ToLiss_XPLM.XPLMAppendMenuItem(ToLiss_CI_Menu_ID, action, ffi.cast("void *", action), 1)
+                    end
+                end
             else
                 ToLiss_XPLM.XPLMAppendMenuSeparator(ToLiss_Menu_ID)
             end
@@ -702,8 +887,8 @@ function ToLiss_MainTimer()
     end
     -- Checks the flight state
     ToLiss_Check_FlightState()
-    -- Flight revenue calculation
-    ToLiss_Calc_Revenue()
+    -- Handles end-of-flight economics
+    ToLiss_Handle_EndOfFlight_Economics()
     -- Calculate operating costs
     ToLiss_Calc_Operating_Costs()
     -- Check for random events (once per minute to avoid spamming)
@@ -742,7 +927,7 @@ function flight_start()
             if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then print("ToLiss Wear and Tear: Set aircraft and engine age to brand new.") end
         end
         run_after_time(ToLiss_Apply_Age,InitDelay)
-        run_after_time(ToLiss_Calc_PERF,(InitDelay+1)) -- Calculates PERF for the MCDU after applying age
+        run_after_time(ToLiss_Automate_MCDU_Config,(InitDelay+1)) -- Automatically configure MCDU
         if Table_GetVal(ToLiss_Persistence_Data,"Debug") == 1 then print("ToLiss Wear and Tear: Persistence data applied.") end
         --[[ Autosave timer ]]
         if Table_GetVal(ToLiss_Persistence_Data,"Persistence") == 1 and Table_GetVal(ToLiss_Persistence_Data,"Autosave") == 1 and Table_GetVal(ToLiss_Persistence_Data,"AutosaveInterval") > 0 then run_at_interval(ToLiss_SavePersistence,Table_GetVal(ToLiss_Persistence_Data,"AutosaveInterval")) print("ToLiss Wear and Tear: Autosave timer started (interval: "..Table_GetVal(ToLiss_Persistence_Data,"AutosaveInterval").." s).") end
